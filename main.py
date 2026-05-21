@@ -48,54 +48,49 @@ user_state = {}   # {user_id: {step, title, episode, thumbnail}}
 # ───────────────────────────────────────────────────────
 
 def get_qualities(master_url: str) -> list[dict]:
-    """Uses yt-dlp to extract available video resolutions from the M3U8 without downloading."""
+    """Uses yt-dlp to extract available video resolutions with heavy browser emulation."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
+        # Force a standard, modern browser fingerprint
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': master_url
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'Referer': master_url,
+            'Accept-Language': 'en-US,en;q=0.9',
         }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(master_url, download=False)
-        
+    
+    # ... (rest of your existing logic remains the same)
     formats = info.get('formats', [])
     seen = {}
     for f in formats:
         h = f.get('height')
-        vcodec = f.get('vcodec')
-        # Ensure it's a video stream and has a height
-        if h and vcodec != 'none':
+        if h and f.get('vcodec') != 'none':
             if h not in seen:
-                seen[h] = {
-                    'resolution': f"{f.get('width', 'unknown')}x{h}",
-                    'height': h,
-                    'bandwidth': f.get('tbr', 0)
-                }
+                seen[h] = {'resolution': f"{f.get('width', 'unknown')}x{h}", 'height': h, 'bandwidth': f.get('tbr', 0)}
     return sorted(seen.values(), key=lambda x: x['height'])
 
-
 def download_with_ytdlp(m3u8_url: str, height: int, output_path: str):
-    """Downloads specific resolution with Tamil audio and English sub using yt-dlp."""
     ydl_opts = {
-        # Format string strictly selects max height and Tamil audio (fallback to best audio)
         'format': f'bestvideo[height<={height}]+bestaudio[language=tam]/bestvideo[height<={height}]+bestaudio/best',
         'subtitleslangs': ['eng'],
         'writesubtitles': True,
         'embedsubtitles': True,
         'merge_output_format': 'mp4',
         'outtmpl': output_path,
+        # Emulate the browser exactly
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': m3u8_url
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'Referer': m3u8_url,
         },
-        'quiet': True,
-        'no_warnings': True
+        'quiet': False
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([m3u8_url])
-
 
 def qlabel(resolution: str) -> str:
     h = resolution.split("x")[-1] if "x" in resolution else resolution
