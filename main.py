@@ -20,7 +20,7 @@ from pyrogram.errors import FloodWait
 #  CONFIG  — edit these
 # ═══════════════════════════════════════════════════════
 API_ID         = 24435985
-API_HASH       = " 0fec896446625478537e43906a4829f8"
+API_HASH       = "0fec896446625478537e43906a4829f8"
 BOT_TOKEN      = "7722665729:AAHDh8TAiv4uv9nfgwoBWZHexD1VEaCdx7Y"
 
 CHANNEL_TAG    = "@Anime_warrior_tamil"
