@@ -1,6 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║         Anime Warrior Tamil — Upload Bot             ║
+║  • Powered by yt-dlp (Bypasses Cloudflare 403)       ║
 ║  • Downloads Tamil audio + English subtitle only     ║
 ║  • Injects watermark into existing English .srt      ║
 ║  • Adds @Anime_warrior_tamil metadata                ║
@@ -9,9 +10,10 @@
 ╚══════════════════════════════════════════════════════╝
 """
 
-import os, re, json, asyncio, logging, subprocess, urllib.request
+import os, re, json, asyncio, logging, subprocess
 from pathlib import Path
 
+import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
@@ -42,50 +44,57 @@ user_state = {}   # {user_id: {step, title, episode, thumbnail}}
 
 
 # ───────────────────────────────────────────────────────
-# M3U8 PARSING
+# YT-DLP CORE (Bypasses Cloudflare)
 # ───────────────────────────────────────────────────────
 
-def is_m3u8(text: str) -> bool:
-    return bool(re.match(r"https?://.+\.m3u8", text.strip()))
-
-
-def parse_master(master_url: str) -> list[dict]:
-    """Return list of {bandwidth, resolution, uri} sorted low→high."""
-    
-    # ── SPOOF BROWSER HEADERS FOR CLOUDFLARE ──
-    req = urllib.request.Request(
-        master_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Referer": master_url  # Many anime sites require a referer
+def get_qualities(master_url: str) -> list[dict]:
+    """Uses yt-dlp to extract available video resolutions from the M3U8 without downloading."""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': master_url
         }
-    )
-    
-    with urllib.request.urlopen(req) as r:
-        content = r.read().decode("utf-8")
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(master_url, download=False)
+        
+    formats = info.get('formats', [])
+    seen = {}
+    for f in formats:
+        h = f.get('height')
+        vcodec = f.get('vcodec')
+        # Ensure it's a video stream and has a height
+        if h and vcodec != 'none':
+            if h not in seen:
+                seen[h] = {
+                    'resolution': f"{f.get('width', 'unknown')}x{h}",
+                    'height': h,
+                    'bandwidth': f.get('tbr', 0)
+                }
+    return sorted(seen.values(), key=lambda x: x['height'])
 
-    base   = master_url.rsplit("/", 1)[0]
-    lines  = content.splitlines()
-    seen   = {}
-    i      = 0
 
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("#EXT-X-STREAM-INF"):
-            bw  = int(m.group(1)) if (m := re.search(r"BANDWIDTH=(\d+)", line)) else 0
-            res = m.group(1) if (m := re.search(r"RESOLUTION=(\d+x\d+)", line)) else "unknown"
-            i  += 1
-            while i < len(lines) and lines[i].strip().startswith("#"):
-                i += 1
-            if i < len(lines):
-                uri = lines[i].strip()
-                if not uri.startswith("http"):
-                    uri = base + "/" + uri
-                seen[res] = {"bandwidth": bw, "resolution": res, "uri": uri}
-        i += 1
-
-    return sorted(seen.values(), key=lambda x: x["bandwidth"])
+def download_with_ytdlp(m3u8_url: str, height: int, output_path: str):
+    """Downloads specific resolution with Tamil audio and English sub using yt-dlp."""
+    ydl_opts = {
+        # Format string strictly selects max height and Tamil audio (fallback to best audio)
+        'format': f'bestvideo[height<={height}]+bestaudio[language=tam]/bestvideo[height<={height}]+bestaudio/best',
+        'subtitleslangs': ['eng'],
+        'writesubtitles': True,
+        'embedsubtitles': True,
+        'merge_output_format': 'mp4',
+        'outtmpl': output_path,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': m3u8_url
+        },
+        'quiet': True,
+        'no_warnings': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([m3u8_url])
 
 
 def qlabel(resolution: str) -> str:
@@ -95,7 +104,7 @@ def qlabel(resolution: str) -> str:
 
 
 # ───────────────────────────────────────────────────────
-# FFPROBE
+# FFPROBE (To identify internal tracks of the yt-dlp file)
 # ───────────────────────────────────────────────────────
 
 def probe(path: str) -> list[dict]:
@@ -107,18 +116,6 @@ def probe(path: str) -> list[dict]:
         return json.loads(r.stdout).get("streams", [])
     except Exception:
         return []
-
-
-def find_index(streams, codec_type, lang_hint):
-    """Return stream index matching codec_type and language hint."""
-    for s in streams:
-        if s.get("codec_type") != codec_type:
-            continue
-        lang = s.get("tags", {}).get("language", "").lower()
-        if lang_hint.lower() in lang:
-            return s["index"]
-    return None
-
 
 def find_first_index(streams, codec_type):
     for s in streams:
@@ -138,9 +135,7 @@ def srt_ts(seconds: float) -> str:
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-
 def parse_srt(text: str) -> list[dict]:
-    """Parse SRT text into list of {idx, start, end, lines}."""
     blocks, raw = [], text.strip().split("\n\n")
     for block in raw:
         blines = block.strip().splitlines()
@@ -161,42 +156,24 @@ def parse_srt(text: str) -> list[dict]:
                        "end": m.group(2), "lines": body})
     return blocks
 
-
-def ts_to_sec(ts: str) -> float:
-    h, m, rest = ts.split(":")
-    s, ms = rest.split(",")
-    return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000
-
-
 def inject_watermark_srt(original_srt: str, wm_text: str, wm_secs: int) -> str:
-    """
-    Prepend watermark entry for 0 → wm_secs.
-    All original entries are kept as-is (they may overlap — players show both).
-    Re-numbers all entries.
-    """
     blocks = parse_srt(original_srt)
-
     wm_block = {
         "idx":   0,
         "start": srt_ts(0),
         "end":   srt_ts(wm_secs),
         "lines": [wm_text]
     }
-
     all_blocks = [wm_block] + blocks
-
     out = []
     for i, b in enumerate(all_blocks, 1):
         out.append(str(i))
         out.append(f"{b['start']} --> {b['end']}")
         out.extend(b["lines"])
         out.append("")
-
     return "\n".join(out)
 
-
 async def extract_srt(raw_path: str, sub_idx: int, srt_out: str):
-    """Extract subtitle track at sub_idx to .srt file."""
     cmd = [
         "ffmpeg", "-y",
         "-i", raw_path,
@@ -219,46 +196,23 @@ async def run_ff(cmd: list, label: str):
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg [{label}] failed:\n{err.decode()[-1200:]}")
 
-
-async def download_raw(uri: str, out: str, label: str, a_idx: int | None, s_idx: int | None):
-    """Download HLS stream mapping ONLY specific requested audio/sub tracks to save bandwidth."""
-    cmd = ["ffmpeg", "-y", "-i", uri, "-map", "0:v:0"] # Always grab the first video
-    
-    if a_idx is not None:
-        cmd.extend(["-map", f"0:{a_idx}"])
-    else:
-        cmd.extend(["-map", "0:a:0?"]) # Ultimate fallback to grab first available audio
-
-    if s_idx is not None:
-        cmd.extend(["-map", f"0:{s_idx}"])
-        
-    cmd.extend(["-c", "copy", "-bsf:a", "aac_adtstoasc", out])
-    await run_ff(cmd, f"dl-{label}")
-
-
 async def build_final(raw_path: str, srt_path: str | None,
-                      final_path: str, tam_idx: int,
+                      final_path: str, tam_idx: int | None,
                       title: str, episode: str, label: str):
-    """
-    Mux: video (copy) + Tamil audio (copy) + optional watermarked English SRT
-    + full metadata. NO re-encoding of video or audio.
-    """
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", raw_path,
-    ]
+    cmd = ["ffmpeg", "-y", "-i", raw_path]
 
     has_sub = srt_path and os.path.exists(srt_path)
     if has_sub:
         cmd += ["-i", srt_path]
 
-    # Map video
+    # Map video (Always stream 0 from input 0 because yt-dlp pre-filtered it)
     cmd += ["-map", "0:v:0", "-c:v", "copy"]
 
-    # Map Tamil audio
-    cmd += ["-map", f"0:{tam_idx}", "-c:a", "copy"]
+    # Map audio if it exists
+    if tam_idx is not None:
+        cmd += ["-map", f"0:{tam_idx}", "-c:a", "copy"]
 
-    # Map subtitle from second input if available
+    # Map external watermarked subtitle
     if has_sub:
         cmd += ["-map", "1:0", "-c:s", "mov_text"]
 
@@ -272,20 +226,21 @@ async def build_final(raw_path: str, srt_path: str | None,
         "-metadata", f"show={title}",
     ]
 
-    # Audio stream metadata
-    cmd += [
-        "-metadata:s:a:0", "language=tam",
-        "-metadata:s:a:0", f"title=Tamil | {CHANNEL_TAG}",
-        "-metadata:s:a:0", f"handler_name={CHANNEL_TAG}",
-    ]
+    # Audio metadata
+    if tam_idx is not None:
+        cmd += [
+            "-metadata:s:a:0", "language=tam",
+            "-metadata:s:a:0", f"title=Tamil | {CHANNEL_TAG}",
+            "-metadata:s:a:0", f"handler_name={CHANNEL_TAG}",
+        ]
 
-    # Subtitle stream metadata
+    # Subtitle metadata
     if has_sub:
         cmd += [
             "-metadata:s:s:0", "language=eng",
             "-metadata:s:s:0", f"title=English | {CHANNEL_TAG}",
             "-metadata:s:s:0", f"handler_name={CHANNEL_TAG}",
-            "-disposition:s:0", "default",   # auto-show subtitle
+            "-disposition:s:0", "default",
         ]
 
     cmd.append(final_path)
@@ -293,7 +248,7 @@ async def build_final(raw_path: str, srt_path: str | None,
 
 
 # ───────────────────────────────────────────────────────
-# UPLOAD  (as Document so player shows subtitle picker)
+# UPLOAD
 # ───────────────────────────────────────────────────────
 
 async def upload_doc(client: Client, chat_id: int,
@@ -333,24 +288,25 @@ async def upload_doc(client: Client, chat_id: int,
 
 
 # ───────────────────────────────────────────────────────
-# PIPELINE  — per quality
+# PIPELINE
 # ───────────────────────────────────────────────────────
 
 async def process_quality(client: Client, chat_id: int,
-                          stream: dict, title: str, episode: str,
+                          stream_info: dict, master_url: str, title: str, episode: str,
                           thumb: str | None, status: Message, num: int, total: int):
 
-    label    = qlabel(stream["resolution"])
+    height   = stream_info['height']
+    label    = qlabel(stream_info['resolution'])
     
     # Generate exactly formatted filename
-    safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() # Clean invalid file characters
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip()
     final_name = f"{safe_title} Ep{episode} {label} {CHANNEL_TAG}.mp4"
     
     base     = os.path.join(DOWNLOAD_DIR, f"{chat_id}_{episode}_{label}")
     raw      = base + "_raw.mp4"
     srt_orig = base + "_orig.srt"
     srt_wm   = base + "_wm.srt"
-    final    = os.path.join(DOWNLOAD_DIR, final_name) # Final path uses formatted name
+    final    = os.path.join(DOWNLOAD_DIR, final_name)
 
     caption = (
         f"🎌 **{title}**\n"
@@ -359,21 +315,11 @@ async def process_quality(client: Client, chat_id: int,
         f"📢 {CHANNEL_TAG}"
     )
 
-    # ── 1. PROBE M3U8 URL FOR TRACKS (Bandwidth Saver) ───
-    await status.edit_text(f"🔍 Probing URL streams to select Tamil & English (Saving Bandwidth)...")
-    url_streams = probe(stream["uri"])
-    
-    orig_tam = find_index(url_streams, "audio", "tam") or find_index(url_streams, "audio", "mal") or find_first_index(url_streams, "audio")
-    orig_sub = find_index(url_streams, "subtitle", "eng") or find_first_index(url_streams, "subtitle")
-
-    # ── 2. SELECTIVE DOWNLOAD ────────────────────────────
-    await status.edit_text(
-        f"⬇️ Downloading **{label}** ({num}/{total})\n"
-        f"`{stream['resolution']}` — {stream['bandwidth']//1000} kbps\n"
-        f"*(Only selected tracks mapping...)*"
-    )
+    # ── 1. DOWNLOAD VIA YT-DLP ───────────────────────────
+    await status.edit_text(f"⬇️ Downloading **{label}** using yt-dlp ({num}/{total})...")
     try:
-        await download_raw(stream["uri"], raw, label, orig_tam, orig_sub)
+        # Run yt-dlp in a background thread so the bot doesn't freeze
+        await asyncio.to_thread(download_with_ytdlp, master_url, height, raw)
     except Exception as e:
         await status.edit_text(f"❌ Download failed [{label}]:\n`{e}`")
         _clean(raw); return
@@ -384,25 +330,22 @@ async def process_quality(client: Client, chat_id: int,
         f"⚙️ Analysing local tracks..."
     )
 
-    # ── 3. PROBE LOCAL TRACKS ────────────────────────────
-    # Tracks will have new indices (e.g. 0,1,2) since we selectively downloaded them
+    # ── 2. PROBE TRACKS ──────────────────────────────────
+    # yt-dlp already mapped the best audio and sub, so we just grab the first available indices
     streams_info = probe(raw)
 
-    tam_idx = find_index(streams_info, "audio", "tam") or find_first_index(streams_info, "audio")
-    eng_sub_idx = find_index(streams_info, "subtitle", "eng") or find_first_index(streams_info, "subtitle")
+    tam_idx = find_first_index(streams_info, "audio")
+    eng_sub_idx = find_first_index(streams_info, "subtitle")
 
-    audio_langs = [f"{s.get('tags',{}).get('language','?')}({s['index']})" for s in streams_info if s.get("codec_type") == "audio"]
-    sub_langs   = [f"{s.get('tags',{}).get('language','?')}({s['index']})" for s in streams_info if s.get("codec_type") == "subtitle"]
-    
     await status.edit_text(
         f"🔍 Final Tracks mapped:\n"
-        f"🔊 Audio: `{'  '.join(audio_langs)}`\n"
-        f"💬 Subs:  `{'  '.join(sub_langs)}`\n"
-        f"✅ Using Audio[{tam_idx}] + Sub[{eng_sub_idx}]\n"
-        f"⚙️ Injecting watermark into subtitle..."
+        f"✅ Video found\n"
+        f"✅ Audio [{'found' if tam_idx is not None else 'Missing'}]\n"
+        f"✅ Subtitle [{'found' if eng_sub_idx is not None else 'Missing'}]\n"
+        f"⚙️ Injecting watermark..."
     )
 
-    # ── 4. EXTRACT + INJECT WATERMARK IN SUBTITLE ────────
+    # ── 3. EXTRACT + INJECT WATERMARK IN SUBTITLE ────────
     srt_path_final = None
     if eng_sub_idx is not None:
         try:
@@ -416,15 +359,14 @@ async def process_quality(client: Client, chat_id: int,
                 f.write(injected)
 
             srt_path_final = srt_wm
-            log.info(f"[{label}] Watermark injected into subtitle.")
         except Exception as e:
-            log.warning(f"[{label}] Subtitle injection failed: {e} — skipping subtitle")
+            log.warning(f"[{label}] Subtitle injection failed: {e}")
             srt_path_final = None
 
-    # ── 5. BUILD FINAL ────────────────────────────────────
+    # ── 4. BUILD FINAL ────────────────────────────────────
     await status.edit_text(
         f"⚙️ Building final **{label}** file\n"
-        f"(Tamil audio + English sub + metadata — no re-encode)..."
+        f"(Merging audio + watermarked sub + metadata)..."
     )
     try:
         await build_final(
@@ -443,7 +385,7 @@ async def process_quality(client: Client, chat_id: int,
         f"✅ Ready **{label}** ({final_mb:.1f} MB)\n📤 Uploading as document..."
     )
 
-    # ── 6. UPLOAD ─────────────────────────────────────────
+    # ── 5. UPLOAD ─────────────────────────────────────────
     try:
         await upload_doc(client, chat_id, final, caption, thumb, status)
     except Exception as e:
@@ -477,20 +419,19 @@ async def cmd_start(client, msg: Message):
         "3️⃣  Send **episode number** (e.g. `01`)\n"
         "4️⃣  Send **thumbnail photo**\n"
         "5️⃣  Send **master.m3u8 URL**\n\n"
-        "**Auto-magic features:**\n"
-        f"✅ Maps Tamil audio + English sub ONLY (saves bandwidth)\n"
+        "**Features:**\n"
+        f"🛡️ Built-in yt-dlp Cloudflare Bypass\n"
+        f"✅ Maps Tamil audio + English sub ONLY\n"
         f"✅ Formatted filenames automatically\n"
         f"✅ Auto-increments episode number after each run\n\n"
         "/cancel — cancel session"
     )
-
 
 @app.on_message(filters.command("upload"))
 async def cmd_upload(client, msg: Message):
     uid = msg.from_user.id
     user_state[uid] = {"step": "title"}
     await msg.reply_text("📝 Send the **anime title:**\n_(e.g. Dragon Ball Z Kai)_")
-
 
 @app.on_message(filters.command("cancel"))
 async def cmd_cancel(client, msg: Message):
@@ -501,7 +442,6 @@ async def cmd_cancel(client, msg: Message):
     else:
         await msg.reply_text("No active session. Use /upload to start.")
 
-
 @app.on_message(filters.photo)
 async def photo_handler(client, msg: Message):
     uid   = msg.from_user.id
@@ -511,12 +451,8 @@ async def photo_handler(client, msg: Message):
     thumb = os.path.join(THUMB_DIR, f"{uid}_thumb.jpg")
     await msg.download(file_name=thumb)
     state["thumbnail"] = thumb
-    state["step"]      = "m3u8"
-    await msg.reply_text(
-        "✅ Thumbnail saved!\n\n"
-        "Now send the **master.m3u8 URL**:"
-    )
-
+    state["step"]      = "url"
+    await msg.reply_text("✅ Thumbnail saved!\n\nNow send the **master URL** (.m3u8 or website URL):")
 
 @app.on_message(filters.text & ~filters.command(["start","upload","cancel"]))
 async def text_handler(client, msg: Message):
@@ -533,10 +469,7 @@ async def text_handler(client, msg: Message):
     if step == "title":
         state["title"] = text
         state["step"]  = "episode"
-        await msg.reply_text(
-            f"✅ Title: **{text}**\n\n"
-            "Send **episode number** (e.g. `01`):"
-        )
+        await msg.reply_text(f"✅ Title: **{text}**\n\nSend **episode number** (e.g. `01`):")
         return
 
     # ── episode ──
@@ -544,44 +477,40 @@ async def text_handler(client, msg: Message):
         ep = text.zfill(2) if text.isdigit() else text
         state["episode"] = ep
         state["step"]    = "thumbnail"
-        await msg.reply_text(
-            f"✅ Episode: **{ep}**\n\n"
-            "Send the **thumbnail photo** (or type `/skip` to skip):"
-        )
+        await msg.reply_text(f"✅ Episode: **{ep}**\n\nSend the **thumbnail photo** (or type `/skip` to skip):")
         return
 
-    # ── allow skipping thumbnail ──
+    # ── skip thumbnail ──
     if step == "thumbnail" and text.lower() == "/skip":
         state["thumbnail"] = None
-        state["step"]      = "m3u8"
-        await msg.reply_text("⏭ Thumbnail skipped.\n\nSend the **master.m3u8 URL**:")
+        state["step"]      = "url"
+        await msg.reply_text("⏭ Thumbnail skipped.\n\nSend the **master URL** (.m3u8 or website URL):")
         return
 
-    # ── m3u8 ──
-    if step == "m3u8":
-        if not is_m3u8(text):
-            await msg.reply_text("❌ That doesn't look like a valid `.m3u8` URL. Try again:"); return
+    # ── URL ──
+    if step == "url":
+        if not text.startswith("http"):
+            await msg.reply_text("❌ That doesn't look like a valid URL. Try again:"); return
 
         master_url = text
         title      = state.get("title", "Anime")
         episode    = state.get("episode", "01")
         thumb      = state.get("thumbnail")
         chat_id    = msg.chat.id
-        
-        # State is NOT deleted here anymore so we can auto-increment!
 
-        status = await msg.reply_text("🔍 Fetching master playlist...")
+        status = await msg.reply_text("🔍 Fetching qualities using yt-dlp...")
 
         try:
-            streams = parse_master(master_url)
+            # Run the yt-dlp network call in a thread
+            streams = await asyncio.to_thread(get_qualities, master_url)
         except Exception as e:
-            await status.edit_text(f"❌ Cannot parse master.m3u8:\n`{e}`"); return
+            await status.edit_text(f"❌ yt-dlp failed to parse URL:\n`{e}`"); return
 
         if not streams:
-            await status.edit_text("❌ No video streams found in master playlist."); return
+            await status.edit_text("❌ No video streams found using yt-dlp."); return
 
         q_lines = "\n".join(
-            f"• `{qlabel(s['resolution'])}` — `{s['resolution']}` — {s['bandwidth']//1000} kbps"
+            f"• `{qlabel(s['resolution'])}` — `{s['resolution']}`"
             for s in streams
         )
         await status.edit_text(
@@ -590,24 +519,24 @@ async def text_handler(client, msg: Message):
             f"📥 Starting pipeline..."
         )
 
-        for i, stream in enumerate(streams, 1):
+        for i, stream_info in enumerate(streams, 1):
             await process_quality(
                 client=client, chat_id=chat_id,
-                stream=stream, title=title, episode=episode,
-                thumb=thumb, status=status,
-                num=i, total=len(streams)
+                stream_info=stream_info, master_url=master_url,
+                title=title, episode=episode, thumb=thumb,
+                status=status, num=i, total=len(streams)
             )
 
         # ── AUTO-INCREMENT LOGIC ──
         ep_len = len(episode)
         try:
             next_ep_num = int(episode) + 1
-            next_ep_str = str(next_ep_num).zfill(ep_len) # Preserves leading zeros like '01' -> '02'
+            next_ep_str = str(next_ep_num).zfill(ep_len)
         except ValueError:
             next_ep_str = episode + "_next"
             
         state["episode"] = next_ep_str
-        # Step remains "m3u8", thumb and title remain loaded
+        # Step remains "url" for the loop
 
         await status.edit_text(
             f"🎉 **All done!**\n\n"
@@ -615,14 +544,13 @@ async def text_handler(client, msg: Message):
             f"✅ {len(streams)} qualities uploaded!\n"
             f"📢 {CHANNEL_TAG}\n\n"
             f"🔄 **Auto-Increment Active:**\n"
-            f"Ready for the next one! Just send the `master.m3u8` URL for **Episode {next_ep_str}**."
+            f"Ready for the next one! Just send the URL for **Episode {next_ep_str}**."
         )
         return
 
     await msg.reply_text("Send /upload to begin.")
 
 
-# ───────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("=== Anime Warrior Bot started ===")
     app.run()
