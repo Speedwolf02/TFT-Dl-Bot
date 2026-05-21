@@ -51,7 +51,18 @@ def is_m3u8(text: str) -> bool:
 
 def parse_master(master_url: str) -> list[dict]:
     """Return list of {bandwidth, resolution, uri} sorted low→high."""
-    with urllib.request.urlopen(master_url) as r:
+    
+    # ── SPOOF BROWSER HEADERS FOR CLOUDFLARE ──
+    req = urllib.request.Request(
+        master_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": master_url  # Many anime sites require a referer
+        }
+    )
+    
+    with urllib.request.urlopen(req) as r:
         content = r.read().decode("utf-8")
 
     base   = master_url.rsplit("/", 1)[0]
